@@ -1,0 +1,31 @@
+[package]
+name = "divine"
+version = "0.1.0"
+edition = "2021"
+description = "Sacred geometry drawn by compass and straightedge — white lines on black"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# lockstep: wgpu 29 + winit 0.30.13, matching the Colliderscope stack this borrows from
+winit = "0.30.13"
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.30"
+anyhow = "1"
+tracing = "0.1"
+png = "0.18"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+
+# The f64 intersection loops and CPU tessellation are hot even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
