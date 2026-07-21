@@ -1,19 +1,6 @@
-mod anim;
-mod color;
-mod app;
-mod figures;
-mod geom;
-mod hud;
-mod infinite;
-mod params;
-mod render;
-mod scene;
-mod shot;
-mod snow;
-mod tess;
-
 use anyhow::Result;
-use params::Params;
+use divine::params::Params;
+use divine::{anim, app, figures, hud, shot, snow};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> Result<()> {

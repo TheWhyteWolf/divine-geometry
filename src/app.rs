@@ -1,5 +1,8 @@
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
@@ -584,6 +587,13 @@ pub struct App {
     ctx: Option<Ctx>,
     state: Option<State>,
     last: Option<Instant>,
+    /// Wasm: the window exists before the GPU does, because adapter/device
+    /// request is async in the browser. It parks here until `pending_gpu`
+    /// resolves.
+    #[cfg(target_arch = "wasm32")]
+    boot_window: Option<Arc<Window>>,
+    #[cfg(target_arch = "wasm32")]
+    pending_gpu: std::rc::Rc<std::cell::RefCell<Option<Result<crate::render::gpu::Gpu>>>>,
 }
 
 impl App {
@@ -656,16 +666,9 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.ctx.is_some() {
-            return;
-        }
-        let attrs = Window::default_attributes()
-            .with_title("divine geometry")
-            .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1100.0));
-        let window = Arc::new(el.create_window(attrs).expect("create window"));
-        let gpu = Gpu::new(window.clone()).expect("gpu init");
+impl App {
+    /// Build the renderer and initial state once a surface exists.
+    fn install(&mut self, window: Arc<Window>, gpu: Gpu) {
         let size = (gpu.config.width, gpu.config.height);
         let mut renderer =
             Renderer::new(gpu.device.clone(), gpu.queue.clone(), size, gpu.config.format);
@@ -677,6 +680,73 @@ impl ApplicationHandler for App {
 
         self.state = Some(state);
         self.ctx = Some(Ctx { renderer, gpu, window });
+        #[cfg(target_arch = "wasm32")]
+        crate::web::hide_loading();
+    }
+
+    /// Wasm: adopt the GPU once its async request resolves, and keep the canvas
+    /// backing buffer matched to its CSS box.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_web(&mut self) {
+        if self.ctx.is_none() {
+            let ready = self.pending_gpu.borrow_mut().take();
+            if let (Some(result), Some(window)) = (ready, self.boot_window.take()) {
+                match result {
+                    Ok(gpu) => self.install(window, gpu),
+                    Err(e) => crate::web::show_fatal(&format!(
+                        "WebGPU unavailable — this needs a browser with WebGPU enabled.\n\n{e:#}"
+                    )),
+                }
+            }
+            return;
+        }
+        // Drive resizes from the CSS box: winit emits Resized in response, which
+        // routes into the same path a native window resize takes.
+        if let (Some(ctx), Some((w, h))) = (self.ctx.as_ref(), crate::web::canvas_size()) {
+            let cur = ctx.window.inner_size();
+            if cur.width != w || cur.height != h {
+                let _ = ctx.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            }
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.ctx.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("divine geometry")
+            .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1100.0));
+        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        let gpu = Gpu::new(window.clone()).expect("gpu init");
+        self.install(window, gpu);
+    }
+
+    /// Wasm: the window is created synchronously and attached to the page's
+    /// canvas, but the GPU arrives later — so nothing else can be built yet.
+    #[cfg(target_arch = "wasm32")]
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        use winit::platform::web::WindowAttributesExtWebSys;
+        if self.ctx.is_some() || self.boot_window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("divine geometry")
+            .with_canvas(crate::web::get_canvas());
+        let window = Arc::new(el.create_window(attrs).expect("create window"));
+        if let Some((w, h)) = crate::web::canvas_size() {
+            let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+        }
+        let pending = self.pending_gpu.clone();
+        let w2 = window.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            *pending.borrow_mut() = Some(Gpu::new_async(w2).await);
+        });
+        window.request_redraw();
+        self.boot_window = Some(window);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -761,8 +831,25 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.poll_web();
+            if let Some(w) = self.boot_window.as_ref() {
+                w.request_redraw();
+            }
+        }
         if let Some(ctx) = self.ctx.as_ref() {
             ctx.window.request_redraw();
         }
     }
+}
+
+/// Wasm entry: winit's web event loop never returns, so this hands off.
+#[cfg(target_arch = "wasm32")]
+pub fn run_web() -> Result<()> {
+    use winit::platform::web::EventLoopExtWebSys;
+    let el = winit::event_loop::EventLoop::new()?;
+    el.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    el.spawn_app(App::default());
+    Ok(())
 }

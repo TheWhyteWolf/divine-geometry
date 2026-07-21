@@ -5,6 +5,9 @@ edition = "2021"
 description = "Sacred geometry drawn by compass and straightedge — white lines on black"
 license = "GPL-3.0-or-later"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 # lockstep: wgpu 29 + winit 0.30.13, matching the Colliderscope stack this borrows from
 winit = "0.30.13"
@@ -13,11 +16,28 @@ bytemuck = { version = "1", features = ["derive"] }
 glam = "0.30"
 anyhow = "1"
 tracing = "0.1"
-png = "0.18"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Offscreen stills are a native-only verification tool.
+png = "0.18"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# pinned = the wasm-bindgen CLI version installed in CI
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "0.4"
+web-time = "1"
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "CssStyleDeclaration",
+] }
 
 [profile.release]
 opt-level = 3

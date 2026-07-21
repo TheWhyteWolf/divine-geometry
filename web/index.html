@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>divine geometry</title>
+<meta name="description" content="Sacred geometry drawn by compass and straightedge — every circle centred on a solved intersection.">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+  #divine {
+    display: block; width: 100vw; height: 100vh;
+    background: #000; outline: none; touch-action: none;
+  }
+  .overlay {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 1em;
+    color: #dfe7f2; background: #000;
+    font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .14em; text-transform: uppercase;
+    text-align: center; white-space: pre-wrap; padding: 2em; z-index: 10;
+  }
+  #fatal { display: none; color: #ff9b9b; text-transform: none; letter-spacing: .04em; }
+  #fatal a { color: #dfe7f2; }
+  /* The app opens with no UI on purpose, so a first-time visitor needs telling
+     that the readout exists at all. Fades out once; never returns. */
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 2.2em;
+    color: #8ea0b8; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .18em; text-transform: uppercase; text-align: center;
+    pointer-events: none; z-index: 5;
+    animation: hintfade 9s ease-in-out forwards;
+  }
+  @keyframes hintfade {
+    0%   { opacity: 0 }
+    12%  { opacity: .85 }
+    72%  { opacity: .85 }
+    100% { opacity: 0 }
+  }
+</style>
+</head>
+<body>
+<canvas id="divine" tabindex="0"></canvas>
+<div id="loading" class="overlay">◍ striking the first circle…</div>
+<div id="hint">press&nbsp;&nbsp;H&nbsp;&nbsp;for controls&nbsp;&nbsp;·&nbsp;&nbsp;N&nbsp;&nbsp;next figure&nbsp;&nbsp;·&nbsp;&nbsp;X&nbsp;&nbsp;endless</div>
+<div id="fatal" class="overlay"></div>
+<script type="module">
+  const fatal = (html) => {
+    const el = document.getElementById('fatal');
+    el.innerHTML = html;
+    el.style.display = 'flex';
+    document.getElementById('loading')?.remove();
+    document.getElementById('hint')?.remove();
+  };
+
+  if (!navigator.gpu) {
+    fatal(
+      "This needs <b>WebGPU</b>, which your browser doesn't expose.<br><br>" +
+      "Chrome or Edge 113+, or Firefox 141+ / Safari 26+.<br>" +
+      "On Linux Firefox you may need <code>dom.webgpu.enabled</code> in about:config.<br><br>" +
+      'The native build has no such requirement: ' +
+      '<a href="https://github.com/TheWhyteWolf/divine-geometry">github.com/TheWhyteWolf/divine-geometry</a>'
+    );
+  } else {
+    try {
+      const init = (await import('./pkg/divine.js')).default;
+      await init();
+      document.getElementById('loading')?.remove();
+      document.getElementById('divine').focus();
+    } catch (e) {
+      // winit's spawn_app escapes via a control-flow exception — not an error.
+      if (e && /Using exceptions for control flow/.test(String(e))) {
+        document.getElementById('loading')?.remove();
+        document.getElementById('divine').focus();
+      } else {
+        fatal('failed to start:<br><br>' + String(e));
+        throw e;
+      }
+    }
+  }
+</script>
+</body>
+</html>
