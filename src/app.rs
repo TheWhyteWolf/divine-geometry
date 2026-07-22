@@ -690,22 +690,43 @@ impl App {
     fn poll_web(&mut self) {
         if self.ctx.is_none() {
             let ready = self.pending_gpu.borrow_mut().take();
-            if let (Some(result), Some(window)) = (ready, self.boot_window.take()) {
-                match result {
-                    Ok(gpu) => self.install(window, gpu),
-                    Err(e) => crate::web::show_fatal(&format!(
+            let (Some(result), Some(window)) = (ready, self.boot_window.take()) else {
+                return;
+            };
+            match result {
+                Ok(gpu) => self.install(window, gpu),
+                Err(e) => {
+                    crate::web::show_fatal(&format!(
                         "WebGPU unavailable — this needs a browser with WebGPU enabled.\n\n{e:#}"
-                    )),
+                    ));
+                    return;
                 }
             }
-            return;
         }
-        // Drive resizes from the CSS box: winit emits Resized in response, which
-        // routes into the same path a native window resize takes.
-        if let (Some(ctx), Some((w, h))) = (self.ctx.as_ref(), crate::web::canvas_size()) {
-            let cur = ctx.window.inner_size();
-            if cur.width != w || cur.height != h {
+
+        // Reconcile the surface with the canvas's true CSS box every frame.
+        //
+        // winit's `Resized` can't be relied on here. Its `inner_size()` is a
+        // value cached from a ResizeObserver (it starts at 0×0), and
+        // `request_inner_size` only rewrites the canvas's CSS width/height — for
+        // a 100vw/100vh canvas that computes to the *same* box, so the observer
+        // never fires and no `Resized` is emitted. Meanwhile the surface was
+        // configured from whatever `inner_size()` read at boot: if the async
+        // device request beat the observer's first callback, that was 0×0,
+        // clamped to a 1×1 surface. Stretched over the viewport, a 1×1 surface
+        // reads as a blank page. So drive the reconfigure ourselves, comparing
+        // against the surface config rather than winit's cache.
+        if let (Some(ctx), Some(state), Some((w, h))) =
+            (self.ctx.as_mut(), self.state.as_mut(), crate::web::canvas_size())
+        {
+            if ctx.gpu.config.width != w || ctx.gpu.config.height != h {
+                // Keep winit's canvas backing buffer in step so it doesn't fight
+                // wgpu over the canvas dimensions, then reconfigure directly.
                 let _ = ctx.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                ctx.gpu.resize(w, h);
+                ctx.renderer.resize((w, h));
+                state.resize((w, h));
+                ctx.renderer.upload_strokes(&state.scene.tess);
             }
         }
     }
