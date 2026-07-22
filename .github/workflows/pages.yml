@@ -34,10 +34,19 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-bindgen CLI + binaryen
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - name: Install binaryen
+        # NOT Ubuntu's apt `binaryen`: it is old enough to reorder the module's
+        # tables during wasm-opt while leaving wasm-bindgen's
+        # __wbindgen_externrefs export bound to the function table, which makes
+        # the page fail to start with
+        #   RangeError: WebAssembly.Table.grow(): failed to grow table by 4
+        env:
+          BINARYEN_VERSION: version_130
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
-          sudo apt-get update && sudo apt-get install -y binaryen
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" | tar xz
+          echo "$PWD/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
       - name: Build web bundle
         run: bash web/build.sh
       - uses: actions/upload-pages-artifact@v3

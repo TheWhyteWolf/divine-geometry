@@ -28,10 +28,23 @@ wasm-bindgen --target web --no-typescript \
     target/wasm32-unknown-unknown/release/divine.wasm
 
 if command -v wasm-opt >/dev/null; then
-    echo "wasm-opt: $(du -h dist/pkg/divine_bg.wasm | cut -f1) →"
+    WASM=dist/pkg/divine_bg.wasm
+    echo "wasm-opt: $(du -h "$WASM" | cut -f1) →"
     wasm-opt -O2 --enable-bulk-memory --enable-nontrapping-float-to-int \
-        dist/pkg/divine_bg.wasm -o dist/pkg/divine_bg.wasm
-    echo "          $(du -h dist/pkg/divine_bg.wasm | cut -f1)"
+        "$WASM" -o "$WASM.opt"
+    # An old wasm-opt (notably Ubuntu's apt `binaryen`) reorders the module's
+    # tables but leaves wasm-bindgen's __wbindgen_externrefs export bound to the
+    # fixed-size function table, so the browser's table.grow(4) at start-up
+    # throws "failed to grow table by 4" and the page never renders. Only adopt
+    # the optimised wasm if its externref table survived intact; otherwise keep
+    # wasm-bindgen's own (correct, if larger) output.
+    if python3 web/check_externref.py "$WASM.opt"; then
+        mv "$WASM.opt" "$WASM"
+        echo "          $(du -h "$WASM" | cut -f1)"
+    else
+        rm -f "$WASM.opt"
+        echo "          skipped — this wasm-opt breaks the externref table; upgrade binaryen" >&2
+    fi
 else
     echo "wasm-opt not found — skipping (install binaryen to shrink the wasm)"
 fi
