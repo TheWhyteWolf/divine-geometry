@@ -689,8 +689,18 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn poll_web(&mut self) {
         if self.ctx.is_none() {
-            let ready = self.pending_gpu.borrow_mut().take();
-            let (Some(result), Some(window)) = (ready, self.boot_window.take()) else {
+            // The async adapter/device request resolves several event-loop turns
+            // after the window is parked, so the first few polls find it pending.
+            // Take the parked window ONLY once the result is actually in hand.
+            // Building `(ready, self.boot_window.take())` as a tuple evaluated the
+            // `take()` unconditionally — a tuple has no short-circuit — so the very
+            // first poll stranded the window while the GPU was still pending, and
+            // by the time it arrived there was no window left to install with:
+            // `install` never ran and the canvas stayed blank with no error.
+            let Some(result) = self.pending_gpu.borrow_mut().take() else {
+                return;
+            };
+            let Some(window) = self.boot_window.take() else {
                 return;
             };
             match result {
