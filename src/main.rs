@@ -1,6 +1,7 @@
 use anyhow::Result;
+use divine::fx::{BgMode, FgMode, TrailMode};
 use divine::params::Params;
-use divine::{anim, app, figures, hud, shot, snow};
+use divine::{anim, app, figures, fx, hud, shot, snow};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> Result<()> {
@@ -73,6 +74,21 @@ fn main() -> Result<()> {
                 1 => anim::MarkMode::Keep,
                 _ => anim::MarkMode::Off,
             },
+            // The layers, by mode index — the same order the B / E / J keys
+            // cycle through, so a still can be reproduced from what's on screen.
+            fx: fx::Fx {
+                bg: BgMode::from_index(num("--bg", 0.0) as u32),
+                bg_gain: num("--bggain", 0.5),
+                bg_scale: num("--bgscale", 3.0),
+                bg_spread: num("--bgspread", 0.35),
+                fg: FgMode::from_index(num("--fg", 0.0) as u32),
+                fg_amount: num("--fgamt", 0.6),
+                fg_seg: num("--fgseg", 6.0),
+                trails: TrailMode::from_index(num("--trails", 0.0) as u32),
+                trail_len: num("--traillen", 0.35),
+                trail_flow: num("--trailflow", 0.0),
+            }
+            .clamped(),
         };
         return shot::render_to_png(std::path::Path::new(&path), &opts);
     }

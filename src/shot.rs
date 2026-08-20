@@ -30,6 +30,9 @@ pub struct ShotOpts {
     pub palette: u32,
     pub snow: crate::snow::SnowMode,
     pub marks: crate::anim::MarkMode,
+    /// The psychedelic layers. Trails need history, so a still that asks for
+    /// them is rendered after a fixed warm-up — see `render_to_png`.
+    pub fx: crate::fx::Fx,
 }
 
 impl Default for ShotOpts {
@@ -48,6 +51,7 @@ impl Default for ShotOpts {
             palette: 0,
             snow: crate::snow::SnowMode::Off,
             marks: crate::anim::MarkMode::Fade,
+            fx: crate::fx::Fx::default(),
         }
     }
 }
@@ -69,6 +73,7 @@ pub fn render_to_png(path: &std::path::Path, opts: &ShotOpts) -> Result<()> {
         state.colors.cycle();
     }
     state.marks = opts.marks;
+    state.fx = opts.fx.clamped();
     if opts.snow != crate::snow::SnowMode::Off {
         state.snow.set_mode(opts.snow, opts.size);
         // Run the field forward so the still catches motes mid-fall, some of
@@ -109,10 +114,7 @@ pub fn render_to_png(path: &std::path::Path, opts: &ShotOpts) -> Result<()> {
         renderer.upload_steps(&state.scene.steps);
         renderer.upload_points(&state.scene.points);
         upload_snow(&mut renderer, &state);
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot") });
-        renderer.encode(&mut encoder, &state.frame_inputs());
-        queue.submit([encoder.finish()]);
+        encode_frames(&device, &queue, &mut renderer, &mut state);
         let (w, h, rgba) = readback::read_texture(&device, &queue, renderer.final_tex())?;
         readback::save_png(path, w, h, &rgba)?;
         tracing::info!(path = %path.display(), grow = opts.grow, "wrote endless still");
@@ -140,10 +142,7 @@ pub fn render_to_png(path: &std::path::Path, opts: &ShotOpts) -> Result<()> {
     renderer.upload_points(&state.scene.points);
     upload_snow(&mut renderer, &state);
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot") });
-    renderer.encode(&mut encoder, &state.frame_inputs());
-    queue.submit([encoder.finish()]);
+    encode_frames(&device, &queue, &mut renderer, &mut state);
 
     let (w, h, rgba) = readback::read_texture(&device, &queue, renderer.final_tex())?;
     readback::save_png(path, w, h, &rgba)?;
@@ -154,6 +153,77 @@ pub fn render_to_png(path: &std::path::Path, opts: &ShotOpts) -> Result<()> {
         "wrote still"
     );
     Ok(())
+}
+
+/// Encode the frame — or, with trails on, the run of frames that leads up to it.
+///
+/// A trail field is a function of its own history, so a single encode of a
+/// trail-enabled scene captures the very first frame, where the history is
+/// empty and the effect invisible. Worse, replaying one *motionless* frame
+/// would only stack the figure on itself and read as a brightness change.
+///
+/// So the warm-up rewinds the construction and walks it forward to the
+/// requested moment at a fixed step, exactly as playback would. The still then
+/// shows what a trail actually is: the pen's recent path, decaying behind it.
+/// Nothing here is sampled from a clock, so the result stays reproducible.
+///
+/// `WARMUP` is the same order as the decay — at the longest setting the field
+/// is within a percent of its limit well before the last frame.
+fn encode_frames(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut Renderer,
+    state: &mut State,
+) {
+    const WARMUP: u32 = 90;
+    const DT: f32 = 1.0 / 60.0;
+
+    let encode_one = |renderer: &mut Renderer, state: &State| {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot") });
+        renderer.encode(&mut encoder, &state.frame_inputs());
+        queue.submit([encoder.finish()]);
+    };
+
+    if !state.fx.trails.is_on() {
+        encode_one(renderer, state);
+        return;
+    }
+
+    state.dt = DT;
+    if state.is_infinite() {
+        // The endless modes are already mid-flight and move on their own; just
+        // let them keep running while the field fills.
+        for _ in 0..WARMUP {
+            if state.tick(DT) {
+                renderer.upload_strokes(&state.scene.tess);
+            }
+            renderer.upload_steps(&state.scene.steps);
+            encode_one(renderer, state);
+        }
+        return;
+    }
+
+    // Rewind by the span the warm-up will replay, then draw forward to the
+    // requested figure time. `seek` clamps, so an early `ft` simply starts at 0.
+    let target = state.anim.ft;
+    let span = WARMUP as f32 * DT * state.anim.speed / state.scene.cons.draw_seconds().max(0.01);
+    let start = (target - span).max(0.0);
+    for i in 0..WARMUP {
+        let ft = start + (target - start) * (i + 1) as f32 / WARMUP as f32;
+        state.anim.seek(ft);
+        state.scene.update(
+            &state.anim,
+            state.scaffold,
+            state.marks,
+            state.colors.palette(),
+            state.t,
+        );
+        state.push_hud_step();
+        renderer.upload_steps(&state.scene.steps);
+        renderer.upload_points(&state.scene.points);
+        encode_one(renderer, state);
+    }
 }
 
 fn upload_snow(renderer: &mut Renderer, state: &State) {

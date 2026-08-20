@@ -103,6 +103,13 @@ pub enum Act {
     SnowMode,
     Gravity,
     Drift,
+    BgMode,
+    BgGain,
+    FgMode,
+    FgAmount,
+    Trails,
+    TrailLen,
+    TrailFlow,
 }
 
 /// One run of text, optionally interactive.
@@ -161,6 +168,8 @@ pub const KEYS: &[&str] = &[
     "SKIP K L     TWIST O I     G SEED   C RESET",
     "V PALETTE   T/Y HUE   U SAT   W SNOW   M MARKS",
     "SHIMMER [ ]    BLOOM - =    F FULLSCREEN    H HIDE",
+    "B BACKGROUND   E FOREGROUND   J TRAILS",
+    "BG GAIN 1 2    FG AMOUNT 3 4    TRAIL 5 6    Q FLOW",
     "MOUSE: CLICK NEXT   RIGHT CLICK BACK   WHEEL ADJUST",
 ];
 

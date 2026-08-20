@@ -139,6 +139,16 @@ impl Colors {
         self.user = true;
     }
 
+    /// The live base hue, in degrees. The background field reads it so the
+    /// ground it paints belongs to the same palette as the ink.
+    pub fn hue(&self) -> f32 {
+        self.hue
+    }
+
+    pub fn sat(&self) -> f32 {
+        self.sat
+    }
+
     pub fn name(&self) -> String {
         if self.user {
             format!("USER {:.0} {:.0}%", self.hue, self.sat * 100.0)

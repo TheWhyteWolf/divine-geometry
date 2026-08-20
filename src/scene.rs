@@ -59,6 +59,12 @@ impl Scene {
         t: f32,
     ) {
         use crate::anim::Phase;
+        // Drop anything appended past the figure's own steps — the app pushes
+        // the HUD's two borrowed slots onto this vec every frame, and the loop
+        // below zips, so without this the vec would grow by two per frame
+        // forever. It also keeps the HUD's slot index fixed, which is what stops
+        // `refresh_hud` from rebuilding the text geometry on every single frame.
+        self.steps.truncate(self.cons.steps.len());
         let mood = FrameMood {
             ft: anim.ft,
             phase_k: anim.phase_k(),
@@ -78,6 +84,38 @@ impl Scene {
         let sc = if marks == MarkMode::Keep { 1.0 } else { scaffold.gain().max(0.35) };
         for (p, &t0) in self.points.iter_mut().zip(&self.node_t) {
             p.level = node_level(t0, anim.ft, secs, mood.global, marks) * sc;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anim::Anim;
+    use crate::color::Colors;
+    use crate::figures;
+
+    /// The app's per-frame order is update → push_hud_step → upload. Nothing in
+    /// that loop may accumulate.
+    #[test]
+    fn the_step_table_does_not_grow_frame_over_frame() {
+        let cons = figures::build(3);
+        let n = cons.steps.len();
+        let mut scene = Scene::new(cons, 1.0);
+        let anim = Anim::default();
+        let pal = Colors::default().palette();
+
+        for frame in 0..120 {
+            scene.update(&anim, ScaffoldVis::Full, MarkMode::Fade, pal, frame as f32 / 60.0);
+            assert_eq!(
+                scene.steps.len(),
+                n,
+                "step table drifted to {} by frame {frame}",
+                scene.steps.len()
+            );
+            // What `State::push_hud_step` appends.
+            scene.steps.push(StepGpu::default());
+            scene.steps.push(StepGpu::default());
         }
     }
 }

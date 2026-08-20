@@ -1,15 +1,30 @@
-//! Five passes:
-//!   P1 stroke + point → scene   (HDR, additive, cleared every frame)
-//!   P2 bloom mip chain over scene
-//!   P3 bloom composited back into scene (additive)
-//!   P4 post grade → final_tex   (sRGB bytes)
-//!   P5 blit → surface
+//! The passes, in order:
 //!
-//! No feedback ping-pong and no kaleido, unlike the Colliderscope pipeline this
-//! borrows from. A construction drawing needs a line drawn eight seconds ago to
-//! look *identical* to one drawn now; under feedback it would be a decayed
-//! smear. Persistence here comes from the step's `head` staying at 1.0 — exact
-//! geometry, exact intensity, cheaper than a trail field.
+//!   P1  stroke + point → scene   (HDR, additive, cleared every frame)
+//!   P2  bloom mip chain over scene
+//!   P3  bloom composited back into scene (additive)
+//!   P3b history[next] = feedback(history[prev]) + scene         if trails on
+//!   P3c background field → the frame (additive; via compose if trails) if bg on
+//!   P4  foreground remap → fx_tex                               if fg on
+//!   P5  post grade → final_tex   (sRGB bytes)
+//!   P6  blit → surface
+//!
+//! P3b, P3c and P4 are the psychedelic layers, and all three default to off.
+//! Off is structural, not a uniform set to zero: the pass is never encoded, its
+//! textures are never written, and post binds the scene directly. So the clean
+//! build renders exactly the five passes it always did, down to the byte.
+//!
+//! That matters because the original argument still stands. A construction
+//! drawing needs a line drawn eight seconds ago to look *identical* to one drawn
+//! now; under feedback it would be a decayed smear. Persistence in the default
+//! build comes from the step's `head` staying at 1.0 — exact geometry, exact
+//! intensity, cheaper than a trail field. The trail field is what you get when
+//! you ask for it, and even then the degenerate case is honest: at `keep = 0`
+//! the history pass writes `0·feedback + scene`, so the history *is* the scene.
+//!
+//! Two structural facts keep the feedback loop from running away. Bloom is
+//! computed over `scene` only and never over the history field, so the loop
+//! carries no halo gain; and the feedback shader clamps its output.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -48,6 +63,55 @@ struct CompositeUniforms {
     _pad: [f32; 3],
 }
 
+/// Background field. 64 bytes; the layout is hand-matched to `field.wgsl` —
+/// `tint` is a `vec3<f32>` and so must land on a 16-byte boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FieldUniforms {
+    pub res: [f32; 2],
+    pub time: f32,
+    pub gain: f32,
+    pub tint: [f32; 3],
+    pub scale: f32,
+    pub hue: f32,
+    pub sat: f32,
+    pub seg: f32,
+    pub warp: f32,
+    pub frac_c: [f32; 2],
+    pub frac_iter: f32,
+    pub mode: u32,
+}
+
+/// Foreground remap. 48 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FxUniforms {
+    pub res: [f32; 2],
+    pub time: f32,
+    pub amount: f32,
+    pub seg: f32,
+    pub rot: f32,
+    pub zoom: f32,
+    pub swirl: f32,
+    pub warp: f32,
+    pub chroma: f32,
+    pub scroll: f32,
+    pub mode: u32,
+}
+
+/// Trail feedback. Every field arrives already framerate-corrected — see
+/// `Fx::feedback_uniforms`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FeedbackUniforms {
+    pub keep: f32,
+    pub flow_alpha: f32,
+    pub rot: f32,
+    pub inv_scale: f32,
+    pub clamp_max: f32,
+    pub _pad: [f32; 3],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostUniforms {
@@ -71,6 +135,15 @@ pub struct FrameInputs {
     pub hud: SceneUniforms,
     pub post: PostUniforms,
     pub bloom_gain: f32,
+    /// The background field. Its pass is encoded only while `bg_on`.
+    pub field: FieldUniforms,
+    pub bg_on: bool,
+    /// The foreground remap. Its pass is encoded only while `fg_on`.
+    pub fx: FxUniforms,
+    pub fg_on: bool,
+    /// Trail feedback. Its pass is encoded only while `trails_on`.
+    pub feedback: FeedbackUniforms,
+    pub trails_on: bool,
 }
 
 // ---------------------------------------------------------------- constants
@@ -140,6 +213,25 @@ fn uts_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+/// Bind group layout for a pass that binds nothing but a uniform block. The
+/// background field generates its image from position and time, so it has no
+/// source texture to sample and cannot use `uts_layout`.
+fn u_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("u"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
 fn uniform_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -184,6 +276,18 @@ fn uts_bind(
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],
+    })
+}
+
+fn u_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
     })
 }
 
@@ -281,6 +385,20 @@ fn begin_pass<'e>(
 
 // --------------------------------------------------------------- the bundle
 
+/// The uniform buffers every fullscreen pass binds. Grouped because
+/// `build_targets` needs all of them at once to rebuild its bind groups, and a
+/// nine-argument function is worse than a struct.
+struct FsBufs<'a> {
+    composite: &'a wgpu::Buffer,
+    /// A `CompositeUniforms` pinned at gain 1 — the additive straight copy of
+    /// the scene into the trail field.
+    one: &'a wgpu::Buffer,
+    post: &'a wgpu::Buffer,
+    blit: &'a wgpu::Buffer,
+    fx: &'a wgpu::Buffer,
+    feedback: &'a wgpu::Buffer,
+}
+
 /// Everything tied to the surface resolution — rebuilt on resize.
 struct Targets {
     scene_view: wgpu::TextureView,
@@ -292,21 +410,50 @@ struct Targets {
     down_bg: Vec<wgpu::BindGroup>,
     up_bg: Vec<wgpu::BindGroup>,
     composite_bg: wgpu::BindGroup,
+
+    /// Trail history, ping-ponged. Untouched unless trails are on.
+    history: [wgpu::TextureView; 2],
+    _history: [wgpu::Texture; 2],
+    /// Reads history[i] to write the decayed field into the other one.
+    feedback_bg: [wgpu::BindGroup; 2],
+    /// The scene, bound at gain 1 for the additive copy into the history field.
+    scene_copy_bg: wgpu::BindGroup,
+
+    /// Where the trail field and the background field are summed, when both are
+    /// on. It exists because the sum must not be visible to the feedback loop:
+    /// the field is near-static, so anything that let it back into the history
+    /// would accumulate it toward `gain / (1 - keep)` and wash the frame out.
+    compose_view: wgpu::TextureView,
+    _compose: wgpu::Texture,
+    /// Copies history[i] into the compose target at gain 1.
+    hist_copy_bg: [wgpu::BindGroup; 2],
+
+    /// Foreground output, plus the three textures it might be asked to read.
+    fx_view: wgpu::TextureView,
+    _fx: wgpu::Texture,
+    fx_bg_scene: wgpu::BindGroup,
+    fx_bg_hist: [wgpu::BindGroup; 2],
+    fx_bg_compose: wgpu::BindGroup,
+
     final_view: wgpu::TextureView,
     final_tex: wgpu::Texture,
+    /// Post reads wherever the enabled layers left the frame: the scene, the
+    /// trail field, or the foreground output. Choosing a bind group is what
+    /// makes "off" cost nothing — there is no branch inside the shader.
     post_bg: wgpu::BindGroup,
+    post_bg_hist: [wgpu::BindGroup; 2],
+    post_bg_compose: wgpu::BindGroup,
+    post_bg_fx: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_targets(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     uts: &wgpu::BindGroupLayout,
     samp: &wgpu::Sampler,
-    composite_u: &wgpu::Buffer,
-    post_u: &wgpu::Buffer,
-    blit_u: &wgpu::Buffer,
+    mirror: &wgpu::Sampler,
+    bufs: &FsBufs<'_>,
     size: (u32, u32),
 ) -> Targets {
     let (w, h) = (size.0.max(8), size.1.max(8));
@@ -354,12 +501,55 @@ fn build_targets(
     let up_bg: Vec<_> = (1..mips as usize)
         .map(|m| uts_bind(device, uts, &bloom_us[m + 1], &bloom_mips[m], samp))
         .collect();
-    let composite_bg = uts_bind(device, uts, composite_u, &bloom_mips[0], samp);
+    let composite_bg = uts_bind(device, uts, bufs.composite, &bloom_mips[0], samp);
+
+    // The FX targets are full-resolution HDR, same as the scene: two halves of
+    // the trail ping-pong, the compose buffer, and the foreground output. They
+    // are allocated whether or not the layers are on — a toggle should not stall
+    // on an allocation — which costs 32 bytes per pixel standing, about 64 MB at
+    // 1080p, alongside the bloom chain that is already there.
+    let history = [
+        make_tex(device, "trail-a", w, h, HDR, 1, wgpu::TextureUsages::empty()),
+        make_tex(device, "trail-b", w, h, HDR, 1, wgpu::TextureUsages::empty()),
+    ];
+    let history_views = [
+        history[0].create_view(&Default::default()),
+        history[1].create_view(&Default::default()),
+    ];
+    let feedback_bg = [
+        uts_bind(device, uts, bufs.feedback, &history_views[0], samp),
+        uts_bind(device, uts, bufs.feedback, &history_views[1], samp),
+    ];
+    let scene_copy_bg = uts_bind(device, uts, bufs.one, &scene_view, samp);
+
+    let compose = make_tex(device, "compose", w, h, HDR, 1, wgpu::TextureUsages::empty());
+    let compose_view = compose.create_view(&Default::default());
+    let hist_copy_bg = [
+        uts_bind(device, uts, bufs.one, &history_views[0], samp),
+        uts_bind(device, uts, bufs.one, &history_views[1], samp),
+    ];
+
+    // The foreground samples through the mirror-repeat sampler: wrapping by
+    // reflection *is* a kaleidoscope's edge behaviour, done in hardware.
+    let fx_tex = make_tex(device, "fx", w, h, HDR, 1, wgpu::TextureUsages::empty());
+    let fx_view = fx_tex.create_view(&Default::default());
+    let fx_bg_scene = uts_bind(device, uts, bufs.fx, &scene_view, mirror);
+    let fx_bg_hist = [
+        uts_bind(device, uts, bufs.fx, &history_views[0], mirror),
+        uts_bind(device, uts, bufs.fx, &history_views[1], mirror),
+    ];
+    let fx_bg_compose = uts_bind(device, uts, bufs.fx, &compose_view, mirror);
 
     let final_tex = make_tex(device, "final", w, h, LDR, 1, wgpu::TextureUsages::COPY_SRC);
     let final_view = final_tex.create_view(&Default::default());
-    let post_bg = uts_bind(device, uts, post_u, &scene_view, samp);
-    let blit_bg = uts_bind(device, uts, blit_u, &final_view, samp);
+    let post_bg = uts_bind(device, uts, bufs.post, &scene_view, samp);
+    let post_bg_hist = [
+        uts_bind(device, uts, bufs.post, &history_views[0], samp),
+        uts_bind(device, uts, bufs.post, &history_views[1], samp),
+    ];
+    let post_bg_compose = uts_bind(device, uts, bufs.post, &compose_view, samp);
+    let post_bg_fx = uts_bind(device, uts, bufs.post, &fx_view, samp);
+    let blit_bg = uts_bind(device, uts, bufs.blit, &final_view, samp);
 
     Targets {
         scene_view,
@@ -371,9 +561,24 @@ fn build_targets(
         down_bg,
         up_bg,
         composite_bg,
+        history: history_views,
+        _history: history,
+        feedback_bg,
+        scene_copy_bg,
+        compose_view,
+        _compose: compose,
+        hist_copy_bg,
+        fx_view,
+        _fx: fx_tex,
+        fx_bg_scene,
+        fx_bg_hist,
+        fx_bg_compose,
         final_view,
         final_tex,
         post_bg,
+        post_bg_hist,
+        post_bg_compose,
+        post_bg_fx,
         blit_bg,
     }
 }
@@ -390,18 +595,27 @@ pub struct Renderer {
     down_p: wgpu::RenderPipeline,
     up_p: wgpu::RenderPipeline,
     composite_p: wgpu::RenderPipeline,
+    field_p: wgpu::RenderPipeline,
+    feedback_p: wgpu::RenderPipeline,
+    fx_p: wgpu::RenderPipeline,
     post_p: wgpu::RenderPipeline,
     blit_p: wgpu::RenderPipeline,
 
     uts: wgpu::BindGroupLayout,
     scene_bgl: wgpu::BindGroupLayout,
     samp: wgpu::Sampler,
+    mirror: wgpu::Sampler,
 
     scene_u: wgpu::Buffer,
     hud_u: wgpu::Buffer,
     composite_u: wgpu::Buffer,
+    one_u: wgpu::Buffer,
     post_u: wgpu::Buffer,
     blit_u: wgpu::Buffer,
+    field_u: wgpu::Buffer,
+    feedback_u: wgpu::Buffer,
+    fx_u: wgpu::Buffer,
+    field_bg: wgpu::BindGroup,
     step_sb: wgpu::Buffer,
     step_cap: u64,
     scene_bg: wgpu::BindGroup,
@@ -424,6 +638,12 @@ pub struct Renderer {
     index_count: u32,
     point_count: u32,
 
+    /// Which half of the trail ping-pong holds the current field.
+    cur: usize,
+    /// Trails on last frame. A layer switched back on would otherwise reveal a
+    /// frozen ghost of whatever was on screen when it was switched off.
+    trails_were_on: bool,
+
     targets: Targets,
 }
 
@@ -435,6 +655,7 @@ impl Renderer {
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         let uts = uts_layout(&device);
+        let u_bgl = u_layout(&device);
 
         // Group 0 for the geometry passes: scene uniform + the per-step state
         // array. The step array is a storage buffer so the fragment shader can
@@ -473,6 +694,17 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // The foreground fold reads far outside 0..1 by design. Reflecting at
+        // the edge is the mirror a kaleidoscope is made of, so let the hardware
+        // be it rather than open-coding the fold in the shader.
+        let mirror = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mirror"),
+            address_mode_u: wgpu::AddressMode::MirrorRepeat,
+            address_mode_v: wgpu::AddressMode::MirrorRepeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let stroke_m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("stroke"),
@@ -484,6 +716,9 @@ impl Renderer {
         });
         let bloom_m = shader(&device, "bloom", include_str!("shaders/bloom.wgsl"));
         let composite_m = shader(&device, "composite", include_str!("shaders/composite.wgsl"));
+        let field_m = shader(&device, "field", include_str!("shaders/field.wgsl"));
+        let feedback_m = shader(&device, "feedback", include_str!("shaders/feedback.wgsl"));
+        let fx_m = shader(&device, "fx", include_str!("shaders/fx.wgsl"));
         let post_m = shader(&device, "post", include_str!("shaders/post.wgsl"));
         let blit_m = shader(&device, "blit", include_str!("shaders/blit.wgsl"));
 
@@ -500,6 +735,15 @@ impl Renderer {
             HDR,
             Some(ADDITIVE),
         );
+        // The FX pipelines are built whether or not the layers are ever switched
+        // on. Naga validates at pipeline creation, so a broken shader fails at
+        // start-up — including in `--shot`, which is the verification path —
+        // rather than the first time somebody presses a key.
+        let field_p =
+            fs_pipeline(&device, "field", &field_m, "fs_field", &u_bgl, HDR, Some(ADDITIVE));
+        let feedback_p =
+            fs_pipeline(&device, "feedback", &feedback_m, "fs_feedback", &uts, HDR, None);
+        let fx_p = fs_pipeline(&device, "fx", &fx_m, "fs_fx", &uts, HDR, None);
         let post_p = fs_pipeline(&device, "post", &post_m, "fs_post", &uts, LDR, None);
         let blit_p = fs_pipeline(&device, "blit", &blit_m, "fs_blit", &uts, surface_format, None);
 
@@ -578,8 +822,18 @@ impl Renderer {
         let scene_u = uniform_buffer(&device, "scene_u", 48);
         let hud_u = uniform_buffer(&device, "hud_u", 48);
         let composite_u = uniform_buffer(&device, "composite_u", 16);
+        let one_u = uniform_buffer(&device, "one_u", 16);
+        queue.write_buffer(
+            &one_u,
+            0,
+            bytemuck::bytes_of(&CompositeUniforms { gain: 1.0, _pad: [0.0; 3] }),
+        );
         let post_u = uniform_buffer(&device, "post_u", 16);
         let blit_u = uniform_buffer(&device, "blit_u", 16);
+        let field_u = uniform_buffer(&device, "field_u", 64);
+        let feedback_u = uniform_buffer(&device, "feedback_u", 32);
+        let fx_u = uniform_buffer(&device, "fx_u", 48);
+        let field_bg = u_bind(&device, &u_bgl, &field_u);
 
         let step_cap = 256 * std::mem::size_of::<StepGpu>() as u64;
         let step_sb = geo_buffer(&device, "step_sb", step_cap, wgpu::BufferUsages::STORAGE);
@@ -599,8 +853,15 @@ impl Renderer {
         let snow_vb_cap = 32 * 1024;
         let snow_vb = geo_buffer(&device, "snow_vb", snow_vb_cap, wgpu::BufferUsages::VERTEX);
 
-        let targets =
-            build_targets(&device, &queue, &uts, &samp, &composite_u, &post_u, &blit_u, size);
+        let bufs = FsBufs {
+            composite: &composite_u,
+            one: &one_u,
+            post: &post_u,
+            blit: &blit_u,
+            fx: &fx_u,
+            feedback: &feedback_u,
+        };
+        let targets = build_targets(&device, &queue, &uts, &samp, &mirror, &bufs, size);
 
         Self {
             device,
@@ -611,16 +872,25 @@ impl Renderer {
             down_p,
             up_p,
             composite_p,
+            field_p,
+            feedback_p,
+            fx_p,
             post_p,
             blit_p,
             uts,
             scene_bgl,
             samp,
+            mirror,
             scene_u,
             hud_u,
             composite_u,
+            one_u,
             post_u,
             blit_u,
+            field_u,
+            feedback_u,
+            fx_u,
+            field_bg,
             step_sb,
             step_cap,
             scene_bg,
@@ -641,21 +911,25 @@ impl Renderer {
             point_vb_cap,
             index_count: 0,
             point_count: 0,
+            cur: 0,
+            trails_were_on: false,
             targets,
         }
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {
-        self.targets = build_targets(
-            &self.device,
-            &self.queue,
-            &self.uts,
-            &self.samp,
-            &self.composite_u,
-            &self.post_u,
-            &self.blit_u,
-            size,
-        );
+        let bufs = FsBufs {
+            composite: &self.composite_u,
+            one: &self.one_u,
+            post: &self.post_u,
+            blit: &self.blit_u,
+            fx: &self.fx_u,
+            feedback: &self.feedback_u,
+        };
+        self.targets =
+            build_targets(&self.device, &self.queue, &self.uts, &self.samp, &self.mirror, &bufs, size);
+        // The trail field is gone with the old textures; don't fade in from it.
+        self.trails_were_on = false;
     }
 
     /// The graded sRGB-byte target — readback source for offscreen stills.
@@ -765,7 +1039,8 @@ impl Renderer {
         self.queue.write_buffer(&self.snow_vb, 0, pb);
     }
 
-    /// Encode P1..P4.
+    /// Encode P1..P5. The FX stages are skipped entirely when their layer is
+    /// off, so the default build encodes exactly the passes it always did.
     pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder, inputs: &FrameInputs) {
         self.queue.write_buffer(&self.scene_u, 0, bytemuck::bytes_of(&inputs.scene));
         self.queue.write_buffer(&self.hud_u, 0, bytemuck::bytes_of(&inputs.hud));
@@ -775,6 +1050,16 @@ impl Renderer {
         let mips = self.targets.bloom_mips.len();
         let comp = CompositeUniforms { gain: inputs.bloom_gain / mips as f32, _pad: [0.0; 3] };
         self.queue.write_buffer(&self.composite_u, 0, bytemuck::bytes_of(&comp));
+        // Only the layers that will actually be encoded get a buffer write.
+        if inputs.bg_on {
+            self.queue.write_buffer(&self.field_u, 0, bytemuck::bytes_of(&inputs.field));
+        }
+        if inputs.trails_on {
+            self.queue.write_buffer(&self.feedback_u, 0, bytemuck::bytes_of(&inputs.feedback));
+        }
+        if inputs.fg_on {
+            self.queue.write_buffer(&self.fx_u, 0, bytemuck::bytes_of(&inputs.fx));
+        }
 
         // P1: geometry → scene.
         {
@@ -839,16 +1124,102 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        // P4: post grade → final_tex.
+        // P3b: trails. history[next] = feedback(history[prev]) + scene.
+        if inputs.trails_on {
+            if !self.trails_were_on {
+                // Switching the layer back on must not fade in from whatever was
+                // frozen in the field when it was switched off — quite possibly
+                // a different figure entirely.
+                for view in &self.targets.history {
+                    begin_pass(encoder, "trail-clear", view, true);
+                }
+            }
+            let prev = self.cur;
+            let next = 1 - self.cur;
+            {
+                let mut pass = begin_pass(encoder, "trail", &self.targets.history[next], true);
+                pass.set_pipeline(&self.feedback_p);
+                pass.set_bind_group(0, &self.targets.feedback_bg[prev], &[]);
+                pass.draw(0..3, 0..1);
+                // Gain 1, additive: this frame's ink lands in the field at full
+                // strength, so the newest line is always exact and only the
+                // older ones have decayed.
+                pass.set_pipeline(&self.composite_p);
+                pass.set_bind_group(0, &self.targets.scene_copy_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            self.cur = next;
+        }
+        self.trails_were_on = inputs.trails_on;
+
+        // P3c: the background field, added under the ink.
+        //
+        // It lands *after* the trail pass, and where it lands is load-bearing.
+        // The field is near-static, so anything that let it reach the history
+        // would accumulate it toward gain/(1 - keep) and wash the frame out
+        // within a second of switching trails on — writing it into the
+        // ping-pong is not enough, because the feedback reads that same
+        // texture next frame.
+        //
+        // So with trails running, the trail field and the background are summed
+        // into a separate compose target that the loop never sees; with trails
+        // off there is no loop and the scene itself is the frame. Either way the
+        // background contributes exactly once per frame, at the gain asked for,
+        // and the foreground still folds it together with the geometry because
+        // it reads whichever texture ended up holding the frame.
+        //
+        // It also lands after the bloom chain — see the shader's header for why
+        // a lit fullscreen field must not enter a zero-threshold bloom.
+        let composed = inputs.bg_on && inputs.trails_on;
+        if composed {
+            let mut pass = begin_pass(encoder, "compose", &self.targets.compose_view, true);
+            pass.set_pipeline(&self.composite_p);
+            pass.set_bind_group(0, &self.targets.hist_copy_bg[self.cur], &[]);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&self.field_p);
+            pass.set_bind_group(0, &self.field_bg, &[]);
+            pass.draw(0..3, 0..1);
+        } else if inputs.bg_on {
+            let mut pass = begin_pass(encoder, "field", &self.targets.scene_view, false);
+            pass.set_pipeline(&self.field_p);
+            pass.set_bind_group(0, &self.field_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // P4: the foreground remap, reading whichever texture holds the frame.
+        if inputs.fg_on {
+            let src = if composed {
+                &self.targets.fx_bg_compose
+            } else if inputs.trails_on {
+                &self.targets.fx_bg_hist[self.cur]
+            } else {
+                &self.targets.fx_bg_scene
+            };
+            let mut pass = begin_pass(encoder, "fx", &self.targets.fx_view, true);
+            pass.set_pipeline(&self.fx_p);
+            pass.set_bind_group(0, src, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // P5: post grade → final_tex.
         {
+            let src = if inputs.fg_on {
+                &self.targets.post_bg_fx
+            } else if composed {
+                &self.targets.post_bg_compose
+            } else if inputs.trails_on {
+                &self.targets.post_bg_hist[self.cur]
+            } else {
+                &self.targets.post_bg
+            };
             let mut pass = begin_pass(encoder, "post", &self.targets.final_view, true);
             pass.set_pipeline(&self.post_p);
-            pass.set_bind_group(0, &self.targets.post_bg, &[]);
+            pass.set_bind_group(0, src, &[]);
             pass.draw(0..3, 0..1);
         }
     }
 
-    /// P5: draw final_tex into the given surface pass.
+    /// P6: draw final_tex into the given surface pass.
     pub fn blit(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.blit_p);
         pass.set_bind_group(0, &self.targets.blit_bg, &[]);

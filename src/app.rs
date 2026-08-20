@@ -14,6 +14,7 @@ use winit::window::{Window, WindowId};
 use crate::anim::{Anim, MarkMode, ScaffoldVis};
 use crate::color::Colors;
 use crate::figures::{self, Knob};
+use crate::fx::{Fx, BG_GAIN, FG_AMOUNT, TRAIL_FLOW, TRAIL_LEN};
 use crate::params::{Params, RATIO, RINGS, SKIP, SYMMETRY};
 use crate::render::gpu::Gpu;
 use crate::render::pipeline::{FrameInputs, PostUniforms, Renderer, SceneUniforms};
@@ -53,6 +54,13 @@ pub struct State {
     pub marks: MarkMode,
     pub colors: Colors,
     pub snow: Snow,
+    /// The two psychedelic layers. Off by default — the construction is still
+    /// the front door.
+    pub fx: Fx,
+    /// Last frame's delta. The trail feedback constants are per-frame factors
+    /// that have to be corrected against it, so the renderer needs it and
+    /// `frame_inputs` is a `&self` method.
+    pub dt: f32,
     pub seed: u64,
     pub hud_mode: Mode,
     pub hud_tess: Tess,
@@ -86,6 +94,8 @@ impl State {
             marks: MarkMode::Fade,
             colors: Colors::default(),
             snow: Snow::new(),
+            fx: Fx::default(),
+            dt: 1.0 / 60.0,
             seed: 0,
             // Opens clean — the figure is the interface. H brings the readout.
             hud_mode: Mode::Off,
@@ -165,6 +175,7 @@ impl State {
     /// Advance time. Returns true if the static geometry needs re-uploading.
     pub fn tick(&mut self, dt: f32) -> bool {
         self.t += dt;
+        self.dt = dt;
         self.snow.update(dt, self.t, self.size);
         if self.inf.is_some() {
             let (mut view, size, t) = (self.view, self.size, self.t);
@@ -242,6 +253,12 @@ impl State {
             },
             post: PostUniforms { res, bright: 1.0, vignette: 0.28 },
             bloom_gain: self.bloom,
+            field: self.fx.field_uniforms(self.t, self.size, &self.colors),
+            bg_on: self.fx.bg.is_on(),
+            fx: self.fx.fx_uniforms(self.t, self.size),
+            fg_on: self.fx.fg.is_on(),
+            feedback: self.fx.feedback_uniforms(self.dt),
+            trails_on: self.fx.trails.is_on(),
         }
     }
 
@@ -309,6 +326,23 @@ impl State {
             fx.push(Token::hot(format!("DRIFT {:.2}", self.snow.drift), Act::Drift));
         }
         out.push(fx);
+
+        // The layers, on the same principle as the line above: each mode is
+        // always offered, its continuous knobs only while that layer is live.
+        let mut layers = vec![Token::hot(format!("BG {}", self.fx.bg.name()), Act::BgMode)];
+        if self.fx.bg.is_on() {
+            layers.push(Token::hot(format!("GAIN {:.2}", self.fx.bg_gain), Act::BgGain));
+        }
+        layers.push(Token::hot(format!("FG {}", self.fx.fg.name()), Act::FgMode));
+        if self.fx.fg.is_on() {
+            layers.push(Token::hot(format!("AMT {:.2}", self.fx.fg_amount), Act::FgAmount));
+        }
+        layers.push(Token::hot(format!("TRAIL {}", self.fx.trails.name()), Act::Trails));
+        if self.fx.trails.is_on() {
+            layers.push(Token::hot(format!("LEN {:.2}", self.fx.trail_len), Act::TrailLen));
+            layers.push(Token::hot(format!("FLOW {:.2}", self.fx.trail_flow), Act::TrailFlow));
+        }
+        out.push(layers);
 
         if self.hud_mode == Mode::Keys {
             out.push(Vec::new());
@@ -423,6 +457,28 @@ impl State {
             Act::Drift => {
                 self.snow.drift =
                     (self.snow.drift + if up { 0.25 } else { -0.25 }).clamp(0.0, 2.5);
+            }
+            Act::BgMode => self.fx.bg = if up { self.fx.bg.next() } else { self.fx.bg.prev() },
+            Act::BgGain => {
+                self.fx.bg_gain = (self.fx.bg_gain + if up { 0.1 } else { -0.1 })
+                    .clamp(BG_GAIN.0, BG_GAIN.1);
+            }
+            Act::FgMode => self.fx.fg = if up { self.fx.fg.next() } else { self.fx.fg.prev() },
+            Act::FgAmount => {
+                self.fx.fg_amount = (self.fx.fg_amount + if up { 0.1 } else { -0.1 })
+                    .clamp(FG_AMOUNT.0, FG_AMOUNT.1);
+            }
+            Act::Trails => {
+                let m = if up { self.fx.trails.next() } else { self.fx.trails.prev() };
+                self.fx.set_trails(m);
+            }
+            Act::TrailLen => {
+                self.fx.trail_len = (self.fx.trail_len + if up { 0.05 } else { -0.05 })
+                    .clamp(TRAIL_LEN.0, TRAIL_LEN.1);
+            }
+            Act::TrailFlow => {
+                self.fx.trail_flow = (self.fx.trail_flow + if up { 0.1 } else { -0.1 })
+                    .clamp(TRAIL_FLOW.0, TRAIL_FLOW.1);
             }
         }
         if changed {
@@ -549,6 +605,38 @@ impl State {
                 self.snow.set_mode(mode, self.size);
             }
             KeyCode::KeyM => self.marks = self.marks.next(),
+
+            // ---- the two psychedelic layers ----
+            KeyCode::KeyB => self.fx.bg = self.fx.bg.next(),
+            KeyCode::KeyE => self.fx.fg = self.fx.fg.next(),
+            KeyCode::KeyJ => {
+                let m = self.fx.trails.next();
+                self.fx.set_trails(m);
+            }
+            KeyCode::Digit1 => {
+                self.fx.bg_gain = (self.fx.bg_gain - 0.1).max(BG_GAIN.0);
+            }
+            KeyCode::Digit2 => {
+                self.fx.bg_gain = (self.fx.bg_gain + 0.1).min(BG_GAIN.1);
+            }
+            KeyCode::Digit3 => {
+                self.fx.fg_amount = (self.fx.fg_amount - 0.1).max(FG_AMOUNT.0);
+            }
+            KeyCode::Digit4 => {
+                self.fx.fg_amount = (self.fx.fg_amount + 0.1).min(FG_AMOUNT.1);
+            }
+            KeyCode::Digit5 => {
+                self.fx.trail_len = (self.fx.trail_len - 0.05).max(TRAIL_LEN.0);
+            }
+            KeyCode::Digit6 => {
+                self.fx.trail_len = (self.fx.trail_len + 0.05).min(TRAIL_LEN.1);
+            }
+            KeyCode::KeyQ => {
+                self.fx.trail_flow = (self.fx.trail_flow + 0.1).min(TRAIL_FLOW.1);
+                if self.fx.trail_flow >= TRAIL_FLOW.1 {
+                    self.fx.trail_flow = TRAIL_FLOW.0;
+                }
+            }
             KeyCode::KeyV => self.colors.cycle(),
             KeyCode::KeyT => self.colors.shift_hue(-15.0),
             KeyCode::KeyY => self.colors.shift_hue(15.0),
@@ -570,8 +658,11 @@ impl State {
             speed = self.anim.speed,
             paused = self.anim.paused,
             params = %self.params.summary(),
+            fx = %self.fx.summary(),
             "state"
         );
+        // Every branch above can move a value the readout shows.
+        self.hud_dirty = true;
         changed
     }
 }

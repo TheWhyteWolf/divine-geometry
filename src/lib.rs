@@ -7,6 +7,7 @@ pub mod anim;
 pub mod app;
 pub mod color;
 pub mod figures;
+pub mod fx;
 pub mod geom;
 pub mod hud;
 pub mod infinite;
